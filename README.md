@@ -12,7 +12,9 @@ cargo build --release
 ```
 
 Environment: `MEMORY_DB` (default `memory.db`), `MEMORY_TOKENS` (default `tokens`),
-`MEMORY_ADDR` (default `127.0.0.1:8750`), `MEMORY_ALLOWED_HOSTS` (default localhost).
+`MEMORY_ADDR` (default `127.0.0.1:8750`), `MEMORY_ALLOWED_HOSTS` (default localhost),
+`MEMORY_EPISODE_RETENTION_DAYS` (default 90; 0 keeps transcripts forever), `MEMORY_QUIET_MINUTES`
+(default 5), `MEMORY_DREAM_TRIGGER` (default none). `memory` with no arguments lists every command.
 
 ## Production
 
@@ -91,3 +93,58 @@ http_headers = { "Authorization" = "Bearer <token>" }
 A static header (rather than `bearer_token_env_var`) also works for Codex
 inside the ChatGPT desktop app, which reads the same config but not your
 shell's environment.
+
+## Transcripts
+
+Besides notes, the server keeps the raw turns of your conversations ("episodes"), uploaded while
+they happen, so agents can search what was said (`memory_recall`, `memory_session`) and a dreamer
+can distill new turns into notes every few minutes instead of waiting for a conversation to end
+(`memory_pending`, then `memory_mark_distilled` per session). The index ends with recent
+conversations that haven't been distilled yet. Each turn carries the most a fact from it can be
+trusted: only your own words in an exact transcript are `user_stated`; replies and
+model-reported turns are `agent_inferred`, and tool output is `external`.
+
+Distilled turns older than `MEMORY_EPISODE_RETENTION_DAYS` (90) are deleted, and older ones aren't
+accepted, so forgetting a note doesn't leave it in transcripts for long. Turns the dreamer hasn't
+read yet are kept.
+
+### Claude Code: hooks
+
+Install the binary on your Mac (`cargo install --path .`), then add to `~/.claude/settings.json`
+(with this repo's path):
+
+```json
+{
+  "env": { "MEMORY_URL": "https://memory.example.com" },
+  "hooks": {
+    "Stop": [{ "hooks": [{ "type": "command", "command": "~/code/memory/clients/claude-code-hook.sh stop", "timeout": 30 }] }],
+    "SessionStart": [{ "hooks": [{ "type": "command", "command": "~/code/memory/clients/claude-code-hook.sh start", "timeout": 60 }] }]
+  }
+}
+```
+
+`stop` uploads the turns added since the last upload after every reply (it remembers its place
+under `~/.local/state/memory`); `start` catches up every session written in the last day and asks
+for a dreamer run. The token comes from the keychain entry `deploy/token.sh` saved. Uploading
+needs `add`.
+
+### claude.ai: logging turns, plus the export
+
+claude.ai has no hooks, so the model logs its own turns with `memory_log_turn`. The server's
+instructions ask for it; to make it reliable, also add to Settings → Profile → personal
+preferences:
+
+> After every reply, call memory_log_turn (Memory connector) with my message verbatim and a one-to-three
+> sentence summary of your reply. Omit `session` on the first call in a conversation, then reuse the
+> one it returns.
+
+The model can skip turns or paraphrase, so these turns are never trusted as your own words. For an
+exact copy, export your data now and then (Settings → Privacy → Export data), unzip it, and import
+`conversations.json` with its own token; re-importing skips what's already there:
+
+```sh
+deploy/token.sh claude-ai-export add
+MEMORY_URL=https://memory.example.com \
+MEMORY_TOKEN=$(security find-generic-password -s memory-mcp-token -a claude-ai-export -w) \
+  memory import claude-ai ~/Downloads/claude-export/conversations.json
+```
