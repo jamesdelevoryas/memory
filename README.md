@@ -22,7 +22,7 @@ won't start unless that path is a mount point, so a missing volume can't turn in
 Its hostname lives in `deploy/config` (untracked; copy `deploy/config.example`), which the deploy scripts read; below it's `memory.example.com`.
 
 - Deploy: `deploy/deploy.sh` (rsyncs source, builds on the VM, installs, restarts). Restarts don't interrupt clients:
-  the server is session-less (like MCP 2026-07-28), finishes in-flight requests on SIGTERM, and Caddy holds new
+  the server is session-less (like MCP 2026-07-28), finishes in-flight requests on SIGTERM, and the edge's Caddy holds new
   requests for up to 15s while it comes back.
 - Tokens: `deploy/token.sh <source> <read|add|consolidate>` mints a token on the server (which stores only its
   hash), reloads the tokens file (`systemctl reload memory`, no restart), and saves the token in the macOS keychain (`memory-mcp-token` / `<source>`). Revoke by
