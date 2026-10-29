@@ -3,7 +3,9 @@
 # installed by deploy.sh. The data lives on a volume whose ext4 filesystem is
 # labeled memory-data; it's mounted at /var/lib/memory whenever it's attached
 # (nofail: the machine still boots without it, and the service then refuses
-# to start rather than run on an empty directory).
+# to start rather than run on an empty directory). The server has no public
+# address: create it on the private network only, behind the edge, which
+# proxies HTTPS to it and NATs its outbound traffic.
 package_update: true
 package_upgrade: true
 packages:
@@ -25,14 +27,20 @@ users:
     no_create_home: true
 mounts:
   - [LABEL=memory-data, /var/lib/memory, ext4, "defaults,nofail,discard", "0", "2"]
+bootcmd:
+  # Hetzner gives a private-only server no default route and no DNS: send
+  # its traffic through the network gateway to the edge's NAT. It goes in
+  # netplan, since a plain route is lost when the package upgrade restarts
+  # systemd-networkd.
+  - |
+    iface=$(ip -o -4 addr show to 10.0.0.0/16 | awk '{print $2; exit}')
+    printf 'network:\n  version: 2\n  ethernets:\n    %s:\n      routes:\n      - to: default\n        via: 10.0.0.1\n        on-link: true\n      nameservers:\n        addresses: [185.12.64.1, 185.12.64.2]\n' "$iface" > /etc/netplan/60-edge-nat.yaml
+    chmod 600 /etc/netplan/60-edge-nat.yaml
+    netplan apply
 runcmd:
-  # Caddy from its official apt repo.
-  - curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
-  - curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt -o /etc/apt/sources.list.d/caddy-stable.list
-  - apt-get update && apt-get install -y caddy
   # Rust toolchain for building on the box.
   - curl -sSf https://sh.rustup.rs | HOME=/root sh -s -- -y --profile minimal
-  - ufw allow OpenSSH && ufw allow 80/tcp && ufw allow 443/tcp && ufw --force enable
+  - ufw allow OpenSSH && ufw allow from 10.0.0.0/16 to any port 8750 proto tcp && ufw --force enable
   - install -d -o root -g memory -m 0750 /etc/memory
   # The memory user's uid can differ from the machine that wrote the volume.
   - if mountpoint -q /var/lib/memory; then chown memory:memory /var/lib/memory && chmod 0700 /var/lib/memory && find /var/lib/memory -mindepth 1 -maxdepth 1 ! -name lost+found -exec chown -R memory:memory {} +; fi

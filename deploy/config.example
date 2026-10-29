@@ -1,4 +1,10 @@
-# Copy to deploy/config (untracked) and set your server's public hostname.
-# The deploy scripts read it; deploy.sh fills it into the Caddyfile and the
-# systemd unit on the server.
+# Copy to deploy/config (untracked) and fill in. The deploy scripts read it.
+#
+# The public hostname, served by the edge; deploy.sh fills it into the
+# systemd unit as the allowed Host header.
 MEMORY_DOMAIN=memory.example.com
+# The server's address on the private network: the service listens there and
+# the deploy scripts ssh to it (through the edge).
+MEMORY_PRIVATE_IP=10.0.0.10
+# Optional: a different ssh target.
+# MEMORY_HOST=root@10.0.0.10
