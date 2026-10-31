@@ -6,17 +6,16 @@ HOST=${1:-$HOST}
 cd "$(dirname "$0")/.."
 ssh "$HOST" mkdir -p /root/src/memory
 rsync -az --delete --exclude target --exclude .git --exclude '*.db*' --exclude /tokens --exclude /deploy/config ./ "$HOST:/root/src/memory/"
-ssh "$HOST" bash -se -- "$MEMORY_DOMAIN" <<'REMOTE'
+ssh "$HOST" bash -se -- "$MEMORY_DOMAIN" "${MEMORY_PRIVATE_IP:-127.0.0.1}" <<'REMOTE'
 set -euo pipefail
-DOMAIN=$1
+DOMAIN=$1 ADDR=$2
 cd /root/src/memory
 ~/.cargo/bin/cargo build --release --locked
 install -m 0755 target/release/memory /usr/local/bin/memory
 install -m 0755 deploy/backup.sh /usr/local/bin/memory-backup
 install -m 0644 deploy/memory-backup.service deploy/memory-backup.timer /etc/systemd/system/
 # The domain lives in the untracked deploy/config, not in the repo.
-sed "s/@DOMAIN@/$DOMAIN/g" deploy/memory.service > /etc/systemd/system/memory.service
-sed "s/@DOMAIN@/$DOMAIN/g" deploy/Caddyfile > /etc/caddy/Caddyfile
+sed "s/@DOMAIN@/$DOMAIN/g; s/@ADDR@/$ADDR/g" deploy/memory.service > /etc/systemd/system/memory.service
 touch /etc/memory/tokens && chown root:memory /etc/memory/tokens && chmod 0640 /etc/memory/tokens
 # The dreamer: its own user, with Claude Code installed in its home.
 id dreamer >/dev/null 2>&1 || useradd --system --home-dir /var/lib/memory-dreamer --shell /usr/sbin/nologin dreamer
@@ -30,7 +29,11 @@ install -m 0644 deploy/memory-dreamer.service deploy/memory-dreamer.timer deploy
 systemctl daemon-reload
 systemctl enable --now memory memory-backup.timer
 systemctl restart memory
-systemctl reload caddy
+# Caddy terminates TLS here only when no proxy on another machine does.
+if systemctl is-active -q caddy; then
+  sed "s/@DOMAIN@/$DOMAIN/g" deploy/Caddyfile > /etc/caddy/Caddyfile
+  systemctl reload caddy
+fi
 if [ -f /etc/memory-dreamer/env ]; then
   systemctl enable --now memory-dreamer.timer memory-dreamer.path
 else
