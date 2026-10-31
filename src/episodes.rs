@@ -133,9 +133,9 @@ pub struct Session {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     /// Episodes stored for this session.
-    pub episodes: u64,
+    pub episodes: i64,
     /// Episodes the dreamer hasn't read yet.
-    pub undistilled: u64,
+    pub undistilled: i64,
     /// The last episode the dreamer has read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub distilled_through: Option<String>,
@@ -557,9 +557,9 @@ pub fn truncate(s: &str, max: usize) -> String {
     out
 }
 
-fn integer(row: &turso::Row, i: usize) -> Result<u64> {
+fn integer(row: &turso::Row, i: usize) -> Result<i64> {
     match row.get_value(i)? {
-        Value::Integer(n) => Ok(n as u64),
+        Value::Integer(n) => Ok(n),
         other => bail!("column {i}: expected an integer, got {other:?}"),
     }
 }
