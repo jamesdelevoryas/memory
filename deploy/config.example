@@ -2,3 +2,8 @@
 # The deploy scripts read it; deploy.sh fills it into the Caddyfile and the
 # systemd unit on the server.
 MEMORY_DOMAIN=memory.example.com
+# If a proxy on another machine forwards to this server over a private
+# network: the server's private IP. It then listens there instead of on
+# 127.0.0.1, and deploy.sh leaves Caddy alone unless it's running.
+# MEMORY_PRIVATE_IP=10.0.0.10
+# MEMORY_HOST=root@10.0.0.10
