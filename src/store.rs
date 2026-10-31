@@ -113,15 +113,21 @@ impl Store {
         conn.execute_batch(TABLES)
             .await
             .context("creating tables")?;
+        conn.execute_batch(crate::episodes::TABLES)
+            .await
+            .context("creating episode tables")?;
         migrate(&conn).await.context("migrating schema")?;
         conn.execute_batch(INDEXES)
             .await
             .context("creating indexes")?;
+        conn.execute_batch(crate::episodes::INDEXES)
+            .await
+            .context("creating episode indexes")?;
         drop(conn);
         Ok(Self { db })
     }
 
-    fn conn(&self) -> Result<turso::Connection> {
+    pub(crate) fn conn(&self) -> Result<turso::Connection> {
         let conn = self.db.connect()?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         Ok(conn)
@@ -444,7 +450,7 @@ async fn update(conn: &turso::Connection, m: &Memory) -> Result<()> {
     Ok(())
 }
 
-fn now() -> String {
+pub(crate) fn now() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
@@ -465,23 +471,23 @@ fn normalize_tags(tags: Vec<String>) -> Result<Vec<String>> {
     Ok(out)
 }
 
-fn enum_str<T: Serialize>(v: &T) -> String {
+pub(crate) fn enum_str<T: Serialize>(v: &T) -> String {
     match serde_json::to_value(v) {
         Ok(serde_json::Value::String(s)) => s,
         other => unreachable!("unit enum serialized as {other:?}"),
     }
 }
 
-fn parse_enum<T: serde::de::DeserializeOwned>(s: &str) -> Result<T> {
+pub(crate) fn parse_enum<T: serde::de::DeserializeOwned>(s: &str) -> Result<T> {
     serde_json::from_value(serde_json::Value::String(s.to_string()))
         .with_context(|| format!("unexpected value {s:?} in database"))
 }
 
-fn opt_text(s: Option<String>) -> Value {
+pub(crate) fn opt_text(s: Option<String>) -> Value {
     s.map(Value::Text).unwrap_or(Value::Null)
 }
 
-fn text(row: &turso::Row, i: usize) -> Result<Option<String>> {
+pub(crate) fn text(row: &turso::Row, i: usize) -> Result<Option<String>> {
     Ok(match row.get_value(i)? {
         Value::Null => None,
         Value::Text(s) => Some(s),
@@ -489,7 +495,7 @@ fn text(row: &turso::Row, i: usize) -> Result<Option<String>> {
     })
 }
 
-fn required(row: &turso::Row, i: usize) -> Result<String> {
+pub(crate) fn required(row: &turso::Row, i: usize) -> Result<String> {
     text(row, i)?.with_context(|| format!("column {i} is unexpectedly NULL"))
 }
 

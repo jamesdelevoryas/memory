@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the memory dreamer when a client asks (POST /dream)
+
+[Path]
+# The server writes this file (MEMORY_DREAM_TRIGGER in memory.service).
+PathModified=/var/lib/memory/dream-requested
+Unit=memory-dreamer.service
+
+[Install]
+WantedBy=multi-user.target

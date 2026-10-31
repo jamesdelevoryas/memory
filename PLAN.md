@@ -34,6 +34,35 @@ Rules:
 - Writes are **compare-and-swap**: revising or forgetting a note takes the version you read and fails if it changed since.
 - **The index** is generated deterministically (no model) from notes' names and descriptions, grouped by scope, and served by the `memory_index` tool, which agents call at the start of a task. It's deliberately not in the server's connection instructions: those are frozen at connect time, land in the system prompt with elevated trust, and Claude Code truncates them at 2048 characters. Only `user_stated` and `agent_inferred` notes are listed; external content is reachable through `memory_list` and `memory_search`.
 
+### Episodes (added 2026-10-26)
+
+Notes are the semantic layer; under them is an episodic one: the raw turns of conversations, so agents can search what was said and a **dreamer** can distill new turns into notes within minutes, without waiting for conversations to end (they rarely do).
+
+```sql
+CREATE TABLE sessions (
+  id                TEXT PRIMARY KEY,  -- <source>:<the client's session id>
+  source            TEXT NOT NULL,
+  via               TEXT NOT NULL,     -- transcript (hook, import) | model (memory_log_turn)
+  title             TEXT,
+  distilled_through TEXT,              -- the last episode the dreamer has read
+  summary           TEXT,              -- the dreamer's running summary
+  created_at        TEXT NOT NULL,
+  updated_at        TEXT NOT NULL      -- when episodes last arrived
+);
+CREATE TABLE episodes (
+  id TEXT PRIMARY KEY,                 -- UUIDv7 on arrival: the dreamer's cursor
+  session TEXT NOT NULL, source TEXT NOT NULL,
+  key TEXT NOT NULL,                   -- the client's message id; unique per source
+  role TEXT NOT NULL,                  -- user | assistant | tool
+  text TEXT NOT NULL, at TEXT NOT NULL
+);
+```
+
+- **Arrival.** Claude Code's `Stop` hook uploads new transcript lines after every reply (`POST /episodes`, via `memory upload claude-code`); `SessionStart` catches up recent sessions and asks for a dreamer run (`POST /dream`, which writes `MEMORY_DREAM_TRIGGER` for a systemd path unit). claude.ai has no hooks, so its model calls `memory_log_turn`; `memory import claude-ai` loads the official export as an exact backfill. Re-uploads are skipped by message id.
+- **Distilling.** `memory_pending` lists sessions with unread turns that have been quiet for `MEMORY_QUIET_MINUTES` (5), so the dreamer doesn't save something you correct two messages later. It reads each from `distilled_through` with `memory_session`, writes notes, and records its place and a running summary with `memory_mark_distilled`. Each episode is read once, so a forgotten note isn't revived from turns already distilled.
+- **Trust.** The server assigns each turn's `origin` from role and arrival: your words in an exact transcript are `user_stated`; replies and model-reported turns are at most `agent_inferred`; tool calls, tool output, and attachments are `external`.
+- **Retention.** Distilled turns older than `MEMORY_EPISODE_RETENTION_DAYS` (90) are deleted hourly, and older turns aren't accepted. Undistilled turns are kept.
+
 ## MCP tools
 
 | Tool | What it does | Permission |
@@ -44,6 +73,11 @@ Rules:
 | `memory_list` | Every note, paginated by name; with `since`, only notes written or revised since then | read |
 | `memory_write` | Create a note, or replace one given the version you read; `source` comes from the token | add |
 | `memory_forget` | Delete a note given the version you read | consolidate |
+| `memory_recall` | Full-text search over past conversations' turns | read |
+| `memory_session` | One conversation in order, paginated, with the dreamer's summary | read |
+| `memory_pending` | Conversations with turns not yet distilled, skipping active ones | read |
+| `memory_mark_distilled` | Record how far the dreamer has read a conversation, with its summary | consolidate |
+| `memory_log_turn` | Record a turn, for clients that can't upload transcripts (claude.ai) | add |
 
 To merge two notes, revise one with the combined content and forget the other.
 
