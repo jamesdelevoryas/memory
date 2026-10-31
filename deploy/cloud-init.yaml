@@ -23,6 +23,12 @@ users:
     system: true
     shell: /usr/sbin/nologin
     no_create_home: true
+  # Runs the dreamer (deploy.sh installs Claude Code in its home).
+  - name: dreamer
+    system: true
+    shell: /usr/sbin/nologin
+    homedir: /var/lib/memory-dreamer
+    no_create_home: true
 mounts:
   - [LABEL=memory-data, /var/lib/memory, ext4, "defaults,nofail,discard", "0", "2"]
 runcmd:

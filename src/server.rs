@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     auth::{Client, Level},
-    episodes::{Episode, NewEpisode, Role, Session, Upload, Via},
+    episodes::{Episode, NewEpisode, Role, Session, Upload, Via, truncate},
     ingest::Settings,
     store::{Memory, NewMemory, Origin, Store, WriteError},
 };
@@ -24,6 +24,8 @@ const DEFAULT_LIST_LIMIT: u32 = 25;
 const MAX_LIST_LIMIT: u32 = 100;
 const DEFAULT_SESSION_LIMIT: u32 = 50;
 const MAX_SESSION_LIMIT: u32 = 200;
+/// How much of a tool turn memory_session shows with `brief`.
+const BRIEF_TOOL_CHARS: usize = 200;
 /// Sessions with undistilled turns listed at the end of the index.
 const INDEX_ACTIVITY: u32 = 10;
 
@@ -130,6 +132,10 @@ pub struct SessionParams {
     pub after: Option<String>,
     /// Episodes per page (default 50, max 200).
     pub limit: Option<u32>,
+    /// Cut tool calls and tool output to their first 200 characters, to read
+    /// the conversation itself without the noise.
+    #[serde(default)]
+    pub brief: bool,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -482,7 +488,7 @@ impl MemoryServer {
             .limit
             .unwrap_or(DEFAULT_SESSION_LIMIT)
             .clamp(1, MAX_SESSION_LIMIT);
-        let (session, episodes) = self
+        let (session, mut episodes) = self
             .store
             .session(&p.session, p.after.as_deref(), limit)
             .await
@@ -490,6 +496,13 @@ impl MemoryServer {
             .ok_or_else(|| {
                 ErrorData::invalid_params(format!("no session {:?}", p.session), None)
             })?;
+        if p.brief {
+            for e in &mut episodes {
+                if e.role == Role::Tool {
+                    e.text = truncate(&e.text, BRIEF_TOOL_CHARS);
+                }
+            }
+        }
         let next_cursor =
             (episodes.len() == limit as usize).then(|| episodes[episodes.len() - 1].id.clone());
         tracing::info!(

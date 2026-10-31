@@ -39,7 +39,7 @@ Its hostname lives in `deploy/config` (untracked; copy `deploy/config.example`),
   To restore, stop `memory`, extract the tarball's `db/` into `/var/lib/memory/`, `chown -R memory:memory`, and start it.
 - The volume's ext4 filesystem is labeled `memory-data` (`e2label <device> memory-data` once, for a new volume), and
   `cloud-init.yaml` mounts that label at `/var/lib/memory`. Moving to a new server: create it with `cloud-init.yaml`,
-  copy `/etc/memory/{tokens,backup.env,backup_key}` over, stop `memory` on the old server, move the volume, reboot the
+  copy `/etc/memory/{tokens,backup.env,backup_key}` and `/etc/memory-dreamer/env` over, stop `memory` on the old server, move the volume, reboot the
   new server so it mounts, and run `deploy/deploy.sh`.
 
 ## Consolidation
@@ -110,22 +110,23 @@ read yet are kept.
 
 ### Claude Code: hooks
 
-Install the binary on your Mac (`cargo install --path .`), then add to `~/.claude/settings.json`
-(with this repo's path):
+Install the binary on your Mac (`cargo install --path .`), then add to `~/.claude/settings.json`:
 
 ```json
 {
   "env": { "MEMORY_URL": "https://memory.example.com" },
   "hooks": {
-    "Stop": [{ "hooks": [{ "type": "command", "command": "~/code/memory/clients/claude-code-hook.sh stop", "timeout": 30 }] }],
-    "SessionStart": [{ "hooks": [{ "type": "command", "command": "~/code/memory/clients/claude-code-hook.sh start", "timeout": 60 }] }]
+    "Stop": [{ "hooks": [{ "type": "command", "timeout": 30,
+      "command": "MEMORY_TOKEN=$(security find-generic-password -s memory-mcp-token -a claude-code -w) ~/.cargo/bin/memory upload claude-code" }] }],
+    "SessionStart": [{ "hooks": [{ "type": "command", "timeout": 60,
+      "command": "export MEMORY_TOKEN=$(security find-generic-password -s memory-mcp-token -a claude-code -w); ~/.cargo/bin/memory upload claude-code --recent; ~/.cargo/bin/memory dream 2>/dev/null || true" }] }]
   }
 }
 ```
 
-`stop` uploads the turns added since the last upload after every reply (it remembers its place
-under `~/.local/state/memory`); `start` catches up every session written in the last day and asks
-for a dreamer run. The token comes from the keychain entry `deploy/token.sh` saved. Uploading
+After every reply, `Stop` uploads the turns added since the last upload (it remembers its place
+under `~/.local/state/memory`). `SessionStart` catches up every session written in the last day
+and asks for a dreamer run. The token is the keychain entry `deploy/token.sh` saved; uploading
 needs `add`.
 
 ### claude.ai: logging turns, plus the export
@@ -148,3 +149,21 @@ MEMORY_URL=https://memory.example.com \
 MEMORY_TOKEN=$(security find-generic-password -s memory-mcp-token -a claude-ai-export -w) \
   memory import claude-ai ~/Downloads/claude-export/conversations.json
 ```
+
+## Dreamer
+
+The dreamer reads new conversation turns and saves what's worth keeping as notes. It runs on the
+memory server every 15 minutes, and right away when a client asks (`POST /dream`, from the
+`SessionStart` hook), but only when a conversation has been quiet for 5 minutes with turns it hasn't
+read (`memory pending`). Each run is Claude Code, headless, following [`dreamer.md`](dreamer.md),
+with no built-in tools (no shell, files, or web) and only the memory server's; it runs as its own
+`dreamer` user, which can't read the database or the server's tokens. `deploy.sh` installs it;
+it starts once it has credentials:
+
+```sh
+claude setup-token          # a long-lived token for your Claude subscription
+deploy/dreamer-setup.sh     # asks for that token, mints the dreamer's memory token, starts it
+ssh root@<server> journalctl -fu memory-dreamer    # each run's report
+```
+
+The model defaults to Sonnet; set `DREAMER_MODEL` in `/etc/memory-dreamer/env` to change it.

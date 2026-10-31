@@ -1,0 +1,32 @@
+[Unit]
+Description=Memory dreamer: distill new conversation turns into notes
+After=network-online.target memory.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=dreamer
+Group=dreamer
+Environment=HOME=/var/lib/memory-dreamer
+# MEMORY_URL, MEMORY_TOKEN (consolidate), CLAUDE_CODE_OAUTH_TOKEN; written by deploy/dreamer-setup.sh.
+EnvironmentFile=/etc/memory-dreamer/env
+# Skips the run unless a conversation is waiting (exit 1 means skip).
+ExecCondition=/usr/local/bin/memory pending
+ExecStart=/usr/local/bin/memory-dreamer
+TimeoutStartSec=20min
+StateDirectory=memory-dreamer
+StateDirectoryMode=0700
+
+# Claude Code lives in its home and updates itself there. It can't read the
+# database (/var/lib/memory is the memory user's) or the server's tokens.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=true
+LockPersonality=true
