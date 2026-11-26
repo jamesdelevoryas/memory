@@ -448,20 +448,38 @@ async fn token(
             let (id, secret) = s.split_once(':')?;
             Some((form_decode(id), form_decode(secret)))
         });
-    let (client_id, secret) = match basic {
+    let method = if basic.is_some() { "basic" } else { "post" };
+    let (client_id, basic_secret) = match basic {
         Some((id, secret)) => (id, Some(secret)),
-        None => (
-            req.client_id.clone().unwrap_or_default(),
-            req.client_secret.clone(),
-        ),
+        None => (req.client_id.clone().unwrap_or_default(), None),
     };
     let Some(client) = oauth.client(&client_id) else {
+        tracing::warn!(method, "OAuth token request from an unknown client");
         return oauth_error(StatusCode::UNAUTHORIZED, "invalid_client", "unknown client");
     };
     if let Secret::Hash(expected) = &client.secret {
-        let given = secret.as_deref().map(auth::hash).unwrap_or_default();
-        if !ct_eq(given.as_bytes(), expected.as_bytes()) {
-            tracing::warn!(client = %client.name, "OAuth token request with a bad client secret");
+        // Some clients send the secret both ways; either may match.
+        let matches = |s: &Option<String>| {
+            s.as_deref()
+                .is_some_and(|s| ct_eq(auth::hash(s).as_bytes(), expected.as_bytes()))
+        };
+        if !matches(&basic_secret) && !matches(&req.client_secret) {
+            // Enough to tell a stale or mixed-up secret apart, never the secret.
+            let shape = |s: &Option<String>| match s {
+                Some(s) => format!(
+                    "{}…({} chars)",
+                    s.chars().take(6).collect::<String>(),
+                    s.len()
+                ),
+                None => "none".into(),
+            };
+            tracing::warn!(
+                client = %client.name,
+                method,
+                basic = %shape(&basic_secret),
+                body = %shape(&req.client_secret),
+                "OAuth token request with a bad client secret"
+            );
             return oauth_error(
                 StatusCode::UNAUTHORIZED,
                 "invalid_client",
