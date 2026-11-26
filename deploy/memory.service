@@ -10,6 +10,8 @@ User=memory
 Group=memory
 Environment=MEMORY_DB=/var/lib/memory/memory.db
 Environment=MEMORY_TOKENS=/etc/memory/tokens
+Environment=MEMORY_OAUTH_CLIENTS=/etc/memory/oauth-clients
+Environment=MEMORY_PUBLIC_URL=https://@DOMAIN@
 # The private IP from deploy/config when the proxy is on another machine; else 127.0.0.1.
 Environment=MEMORY_ADDR=@ADDR@:8750
 Environment=MEMORY_ALLOWED_HOSTS=@DOMAIN@
@@ -19,7 +21,7 @@ Environment=MEMORY_DREAM_TRIGGER=/var/lib/memory/dream-requested
 # Never start on an empty directory if the volume failed to mount.
 ExecStartPre=/usr/bin/mountpoint -q /var/lib/memory
 ExecStart=/usr/local/bin/memory serve
-# Re-reads the tokens file without a restart.
+# Re-reads the tokens and OAuth clients files without a restart.
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 StateDirectory=memory

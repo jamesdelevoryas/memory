@@ -10,7 +10,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use axum::{
     extract::{Request, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -66,7 +66,7 @@ impl Tokens {
         Ok(n)
     }
 
-    fn lookup(&self, token: &str) -> Option<Client> {
+    pub fn lookup(&self, token: &str) -> Option<Client> {
         self.map.read().unwrap().get(&hash(token)).cloned()
     }
 }
@@ -108,7 +108,29 @@ pub fn generate() -> String {
     format!("mem_{}", hex::encode(bytes))
 }
 
-pub async fn middleware(State(tokens): State<Tokens>, mut req: Request, next: Next) -> Response {
+/// The server's public base URL: MEMORY_PUBLIC_URL when set, else from the
+/// request's Host header (the proxy in front always speaks https).
+pub fn base_url(public_url: Option<&str>, headers: &HeaderMap) -> String {
+    match public_url {
+        Some(url) => url.trim_end_matches('/').to_string(),
+        None => {
+            let host = headers
+                .get(header::HOST)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("localhost");
+            format!("https://{host}")
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct Gate {
+    pub tokens: Tokens,
+    pub public_url: Option<String>,
+}
+
+pub async fn middleware(State(gate): State<Gate>, mut req: Request, next: Next) -> Response {
+    let tokens = &gate.tokens;
     let token = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -124,9 +146,15 @@ pub async fn middleware(State(tokens): State<Tokens>, mut req: Request, next: Ne
                 token_present = token.is_some(),
                 "rejected unauthenticated request"
             );
+            // Points OAuth clients at the metadata (RFC 9728); clients with a
+            // static token never see this.
+            let challenge = format!(
+                r#"Bearer resource_metadata="{}/.well-known/oauth-protected-resource""#,
+                base_url(gate.public_url.as_deref(), req.headers())
+            );
             (
                 StatusCode::UNAUTHORIZED,
-                [(header::WWW_AUTHENTICATE, "Bearer")],
+                [(header::WWW_AUTHENTICATE, challenge)],
                 "missing or invalid bearer token\n",
             )
                 .into_response()

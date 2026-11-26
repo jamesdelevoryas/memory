@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.104"
 axum = "0.8.9"
+base64 = "0.22.1"
 chrono = "0.4.45"
 hex = "0.4.3"
 libc = "0.2.189"
@@ -21,4 +22,5 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 turso = "=0.7.2"
 ureq = { version = "3.5.0", features = ["json"] }
+url = "2.5.8"
 uuid = { version = "1.26.1", features = ["v7"] }
