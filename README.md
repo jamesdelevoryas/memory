@@ -80,6 +80,23 @@ No OAuth needed: claude.ai custom connectors can send request headers.
 
 To make it the only memory, turn off claude.ai's own memory in Settings → Memory.
 
+### OAuth apps (Gemini, ChatGPT, …)
+
+For apps that can't send a header, the server also speaks standard MCP OAuth
+(discovery metadata, dynamic client registration, authorization code + PKCE).
+OAuth only delivers a token: on the approval page you paste the bearer token
+minted for that app, and the app receives it, so its source, level and
+revocation work like any other client's.
+
+1. Mint the app's token: `deploy/token.sh gemini consolidate`.
+2. Apps that register themselves need nothing more: give them the URL
+   `https://memory.example.com/mcp`. For apps that ask for a client ID and
+   secret (Gemini), register one:
+   `deploy/oauth-client.sh gemini [redirect-uri]` and copy the secret with
+   `security find-generic-password -s memory-oauth-secret -a gemini -w | pbcopy`.
+3. Connect; on the approval page, paste the token from step 1
+   (`security find-generic-password -s memory-mcp-token -a gemini -w | pbcopy`).
+
 ### Codex
 
 In `~/.codex/config.toml`:

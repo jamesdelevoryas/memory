@@ -3,6 +3,7 @@ mod client;
 mod episodes;
 mod health;
 mod ingest;
+mod oauth;
 mod server;
 mod store;
 mod transcripts;
@@ -19,6 +20,8 @@ const USAGE: &str = "\
 usage:
   memory serve                     run the MCP server
   memory token <source> <level>    mint a client token (level: read, add, consolidate)
+  memory oauth-client <client-id> [redirect-uri...]
+                                   mint a pre-registered OAuth client and its secret
 
 client commands (talk to a running server):
   memory upload claude-code            upload new turns of the session a Claude Code hook names on stdin
@@ -30,6 +33,8 @@ client commands (talk to a running server):
 server environment:
   MEMORY_DB             database path (default: memory.db)
   MEMORY_TOKENS         tokens file (default: tokens)
+  MEMORY_OAUTH_CLIENTS  pre-registered OAuth clients file (default: oauth-clients; optional)
+  MEMORY_PUBLIC_URL     public base URL for OAuth metadata (default: https://<Host header>)
   MEMORY_ADDR           listen address (default: 127.0.0.1:8750)
   MEMORY_ALLOWED_HOSTS  comma-separated Host headers to accept (default: localhost)
   MEMORY_EPISODE_RETENTION_DAYS  drop distilled transcripts older than this; 0 keeps them (default: 90)
@@ -61,6 +66,16 @@ async fn main() -> Result<()> {
             eprintln!("Token (give this to the client; it is not stored):\n{token}\n");
             eprintln!("Append this line to the tokens file:");
             println!("{} {source} {level}", auth::hash(&token));
+            Ok(())
+        }
+        ["oauth-client", id, ref redirects @ ..] => {
+            if id.is_empty() || id.contains(char::is_whitespace) || id.starts_with("dyn.") {
+                bail!("client ID must be a single word, e.g. gemini");
+            }
+            let secret = auth::generate().replacen("mem_", "oauth_", 1);
+            eprintln!("Client secret (give this to the app; it is not stored):\n{secret}\n");
+            eprintln!("Append this line to the OAuth clients file:");
+            println!("{id} {} {}", auth::hash(&secret), redirects.join(" "));
             Ok(())
         }
         ["upload", "claude-code"] => {
@@ -118,13 +133,23 @@ async fn serve() -> Result<()> {
 
     let store = store::Store::open(&db_path).await?;
     let tokens = auth::Tokens::load(&tokens_path)?;
+    let public_url = std::env::var("MEMORY_PUBLIC_URL")
+        .ok()
+        .filter(|u| !u.is_empty());
+    let data_dir = std::path::Path::new(&db_path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."))
+        .to_path_buf();
+    let oauth = oauth::OAuth::new(
+        public_url.clone(),
+        tokens.clone(),
+        std::path::Path::new(&env("MEMORY_OAUTH_CLIENTS", "oauth-clients")),
+        &data_dir,
+    )?;
     let health = health::Health::new(health::Config {
         store: store.clone(),
-        data_dir: std::path::Path::new(&db_path)
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(std::path::Path::new("."))
-            .to_path_buf(),
+        data_dir,
         max_disk_percent: env("MEMORY_DISK_MAX_PERCENT", "85").parse()?,
         backup_stamp: std::env::var("MEMORY_BACKUP_STAMP").ok().map(PathBuf::from),
         max_backup_age_hours: env("MEMORY_BACKUP_MAX_AGE_HOURS", "26").parse()?,
@@ -172,22 +197,32 @@ async fn serve() -> Result<()> {
         .nest_service("/mcp", mcp)
         .merge(ingest::router(ingest))
         .layer(axum::middleware::from_fn_with_state(
-            tokens.clone(),
+            auth::Gate {
+                tokens: tokens.clone(),
+                public_url,
+            },
             auth::middleware,
         ))
+        // OAuth discovery, registration, approval and token exchange: public.
+        .merge(oauth::router(oauth.clone()))
         // Unauthenticated, for the external monitor; outside the auth layer.
         .route(
             "/health",
             axum::routing::get(health::handler).with_state(health),
         );
 
-    // `systemctl reload memory` re-reads the tokens file without a restart.
+    // `systemctl reload memory` re-reads the tokens and OAuth clients files
+    // without a restart.
     let mut hangup = signal(SignalKind::hangup())?;
     tokio::spawn(async move {
         while hangup.recv().await.is_some() {
             match tokens.reload() {
                 Ok(n) => tracing::info!(tokens = n, "reloaded tokens"),
                 Err(e) => tracing::error!("reloading tokens (keeping the old ones): {e:#}"),
+            }
+            match oauth.reload() {
+                Ok(n) => tracing::info!(clients = n, "reloaded OAuth clients"),
+                Err(e) => tracing::error!("reloading OAuth clients (keeping the old ones): {e:#}"),
             }
         }
     });

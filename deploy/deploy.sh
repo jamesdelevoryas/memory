@@ -16,7 +16,9 @@ install -m 0755 deploy/backup.sh /usr/local/bin/memory-backup
 install -m 0644 deploy/memory-backup.service deploy/memory-backup.timer /etc/systemd/system/
 # The domain lives in the untracked deploy/config, not in the repo.
 sed "s/@DOMAIN@/$DOMAIN/g; s/@ADDR@/$ADDR/g" deploy/memory.service > /etc/systemd/system/memory.service
-touch /etc/memory/tokens && chown root:memory /etc/memory/tokens && chmod 0640 /etc/memory/tokens
+for f in tokens oauth-clients; do
+  touch /etc/memory/$f && chown root:memory /etc/memory/$f && chmod 0640 /etc/memory/$f
+done
 # The dreamer: its own user, with Claude Code installed in its home.
 id dreamer >/dev/null 2>&1 || useradd --system --home-dir /var/lib/memory-dreamer --shell /usr/sbin/nologin dreamer
 install -d -o dreamer -g dreamer -m 0700 /var/lib/memory-dreamer
