@@ -26,8 +26,22 @@ usually sees only a few new turns.
   records, small talk, and plans that were dropped. Never save secrets or
   credentials. Most turns produce nothing, and a run that writes nothing is a
   good run.
-- **Corrections matter most.** When James corrects or redirects an agent
-  ("no, ...", "don't ...", "I'd rather ..."), that's usually a `feedback` note.
+- **Corrections matter most, and must be right.** When James corrects or
+  redirects an agent ("no, ...", "don't ...", "I'd rather ..."), that's
+  usually a `feedback` note. Quote his words, and record whether he stated a
+  standing rule or reacted to one case: "just delete it I hate it" about one
+  status line, or "not right this second" about one film, is not a general
+  preference. A wrong preference does more harm than a missing one: when in
+  doubt, scope it narrowly or skip it.
+- **Keep what James said apart from what agents found.** Research, prices,
+  listings and timetables go stale within days; save them only if James
+  relied on them, in a separate `external` note.
+- **Date what will go stale.** For trips, appointments, applications,
+  searches, plans and deadlines, set `review_after` to the day after the event
+  (or a month out for open-ended plans), so the index flags the note later.
+- **Sensitive details go in scope `private`**: identity documents and numbers,
+  date of birth, address, phone, payment and account details, sexual health,
+  and other people's medical or private matters. Only some clients can see it.
 - **Don't duplicate.** Agents often save notes during the conversation itself.
   Before writing, check the index and `memory_search`; if a note covers the
   topic, `memory_read` it and revise it with `expected_version` instead of

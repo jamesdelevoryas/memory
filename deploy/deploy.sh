@@ -27,8 +27,14 @@ install -d -o root -g dreamer -m 0750 /etc/memory-dreamer
   sudo -u dreamer -H bash -c 'curl -fsSL https://claude.ai/install.sh | bash' >/dev/null
 install -m 0755 deploy/dreamer.sh /usr/local/bin/memory-dreamer
 install -D -m 0644 dreamer.md /usr/local/share/memory/dreamer.md
-install -m 0644 deploy/memory-dreamer.service deploy/memory-dreamer.timer deploy/memory-dreamer.path /etc/systemd/system/
+install -D -m 0644 consolidator.md /usr/local/share/memory/consolidator.md
+install -m 0644 deploy/memory-dreamer.service deploy/memory-dreamer.timer deploy/memory-dreamer.path \
+  deploy/memory-consolidator.service deploy/memory-consolidator.timer /etc/systemd/system/
 systemctl daemon-reload
+# /health alerts once consolidation is 30 hours stale; a new install starts
+# counting now.
+[ -f /var/lib/memory/last-consolidation ] ||
+  date -u +%Y-%m-%dT%H:%M:%SZ > /var/lib/memory/last-consolidation
 systemctl enable --now memory memory-backup.timer
 systemctl restart memory
 # Caddy terminates TLS here only when no proxy on another machine does.
@@ -40,6 +46,11 @@ if [ -f /etc/memory-dreamer/env ]; then
   systemctl enable --now memory-dreamer.timer memory-dreamer.path
 else
   echo "The dreamer isn't set up yet: run deploy/dreamer-setup.sh"
+fi
+if [ -f /etc/memory-consolidator/env ]; then
+  systemctl enable --now memory-consolidator.timer
+else
+  echo "The consolidator isn't set up yet: run deploy/consolidator-setup.sh"
 fi
 systemctl --no-pager --lines=5 status memory
 REMOTE

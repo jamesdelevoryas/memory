@@ -19,7 +19,8 @@ use tokio::signal::unix::{SignalKind, signal};
 const USAGE: &str = "\
 usage:
   memory serve                     run the MCP server
-  memory token <source> <level>    mint a client token (level: read, add, consolidate)
+  memory token <source> <level> [private]  mint a client token (level: read, add, consolidate;
+                                   private also grants the private scope and transcripts)
   memory oauth-client <client-id> [redirect-uri...]
                                    mint a pre-registered OAuth client and its secret
 
@@ -40,6 +41,8 @@ server environment:
   MEMORY_EPISODE_RETENTION_DAYS  drop distilled transcripts older than this; 0 keeps them (default: 90)
   MEMORY_QUIET_MINUTES  how long a conversation must be idle before the dreamer reads it (default: 5)
   MEMORY_DREAM_TRIGGER  file to write when a client asks for a dreamer run (default: none)
+  MEMORY_BACKUP_STAMP   file holding the last backup's time, for /health (default: none)
+  MEMORY_CONSOLIDATION_STAMP  file holding the last consolidation's time, for /health (default: none)
 
 client environment:
   MEMORY_URL            the server's base URL, e.g. https://memory.example.com
@@ -57,15 +60,16 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["serve"] => serve().await,
-        ["token", source, level] => {
+        ["token", source, level, ref grant @ ..] if matches!(grant, [] | ["private"]) => {
             let _: auth::Level = level.parse()?;
             if source.is_empty() || source.contains(char::is_whitespace) {
                 bail!("source must be a single word, e.g. claude-code");
             }
             let token = auth::generate();
+            let grant = grant.iter().map(|g| format!(" {g}")).collect::<String>();
             eprintln!("Token (give this to the client; it is not stored):\n{token}\n");
             eprintln!("Append this line to the tokens file:");
-            println!("{} {source} {level}", auth::hash(&token));
+            println!("{} {source} {level}{grant}", auth::hash(&token));
             Ok(())
         }
         ["oauth-client", id, ref redirects @ ..] => {
@@ -153,6 +157,10 @@ async fn serve() -> Result<()> {
         max_disk_percent: env("MEMORY_DISK_MAX_PERCENT", "85").parse()?,
         backup_stamp: std::env::var("MEMORY_BACKUP_STAMP").ok().map(PathBuf::from),
         max_backup_age_hours: env("MEMORY_BACKUP_MAX_AGE_HOURS", "26").parse()?,
+        consolidation_stamp: std::env::var("MEMORY_CONSOLIDATION_STAMP")
+            .ok()
+            .map(PathBuf::from),
+        max_consolidation_age_hours: env("MEMORY_CONSOLIDATION_MAX_AGE_HOURS", "30").parse()?,
     });
     let settings = ingest::Settings {
         retention_days: env("MEMORY_EPISODE_RETENTION_DAYS", "90").parse()?,

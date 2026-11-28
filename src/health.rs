@@ -1,7 +1,8 @@
 //! `GET /health`: an unauthenticated summary for an external monitor. It
-//! reports whether the database answers, how old the last successful backup is
-//! (backup.sh writes a timestamp file), and how full the disk is. 200 when all
-//! is well, 503 with the problems otherwise. It reveals no note content.
+//! reports whether the database answers, how old the last successful backup
+//! and the last consolidation run are (each writes a timestamp file), and how
+//! full the disk is. 200 when all is well, 503 with the problems otherwise. It
+//! reveals no note content.
 
 use std::{path::PathBuf, sync::Arc};
 
@@ -22,6 +23,10 @@ pub struct Config {
     /// backup check when unset.
     pub backup_stamp: Option<PathBuf>,
     pub max_backup_age_hours: f64,
+    /// File holding the RFC 3339 time the nightly consolidator last finished;
+    /// no consolidation check when unset.
+    pub consolidation_stamp: Option<PathBuf>,
+    pub max_consolidation_age_hours: f64,
 }
 
 impl Health {
@@ -38,6 +43,8 @@ pub struct Report {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backup_age_hours: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub consolidation_age_hours: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub disk_used_percent: Option<f64>,
     pub problems: Vec<String>,
 }
@@ -49,14 +56,19 @@ pub async fn handler(State(Health(c)): State<Health>) -> (StatusCode, Json<Repor
         .await
         .map_err(|e| format!("database: {e:#}"));
     let disk = disk_used_percent(&c.data_dir).map_err(|e| format!("disk: {e}"));
-    let backup = c.backup_stamp.as_ref().map(|path| {
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| format!("backup: can't read {}: {e}", path.display()))?;
-        let at = chrono::DateTime::parse_from_rfc3339(text.trim())
-            .map_err(|e| format!("backup: bad timestamp in {}: {e}", path.display()))?;
-        Ok((chrono::Utc::now() - at.with_timezone(&chrono::Utc)).num_minutes() as f64 / 60.0)
-    });
-    let report = evaluate(notes, disk, backup, &c);
+    let backup = c.backup_stamp.as_deref().map(|p| stamp_age("backup", p));
+    let consolidation = c
+        .consolidation_stamp
+        .as_deref()
+        .map(|p| stamp_age("consolidation", p));
+    let mut report = evaluate(notes, disk, backup, &c);
+    report.consolidation_age_hours = check_age(
+        consolidation,
+        "consolidation",
+        c.max_consolidation_age_hours,
+        &mut report.problems,
+    );
+    report.ok = report.problems.is_empty();
     let status = if report.ok {
         StatusCode::OK
     } else {
@@ -64,6 +76,39 @@ pub async fn handler(State(Health(c)): State<Health>) -> (StatusCode, Json<Repor
         StatusCode::SERVICE_UNAVAILABLE
     };
     (status, Json(report))
+}
+
+/// Hours since the time a stamp file holds.
+fn stamp_age(what: &str, path: &std::path::Path) -> Result<f64, String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("{what}: can't read {}: {e}", path.display()))?;
+    let at = chrono::DateTime::parse_from_rfc3339(text.trim())
+        .map_err(|e| format!("{what}: bad timestamp in {}: {e}", path.display()))?;
+    Ok((chrono::Utc::now() - at.with_timezone(&chrono::Utc)).num_minutes() as f64 / 60.0)
+}
+
+/// Records a problem when a stamp is missing or older than `max_hours`, and
+/// returns its age rounded to a tenth of an hour.
+fn check_age(
+    age: Option<Result<f64, String>>,
+    what: &str,
+    max_hours: f64,
+    problems: &mut Vec<String>,
+) -> Option<f64> {
+    match age? {
+        Ok(age) => {
+            if age > max_hours {
+                problems.push(format!(
+                    "last {what} was {age:.1} hours ago (limit {max_hours:.0})"
+                ));
+            }
+            Some((age * 10.0).round() / 10.0)
+        }
+        Err(e) => {
+            problems.push(e);
+            None
+        }
+    }
 }
 
 fn evaluate(
@@ -83,26 +128,12 @@ fn evaluate(
             c.max_disk_percent
         ));
     }
-    let backup_age = match backup {
-        Some(Ok(age)) => {
-            if age > c.max_backup_age_hours {
-                problems.push(format!(
-                    "last backup was {age:.1} hours ago (limit {:.0})",
-                    c.max_backup_age_hours
-                ));
-            }
-            Some(age)
-        }
-        Some(Err(e)) => {
-            problems.push(e);
-            None
-        }
-        None => None,
-    };
+    let backup_age_hours = check_age(backup, "backup", c.max_backup_age_hours, &mut problems);
     Report {
         ok: problems.is_empty(),
         notes,
-        backup_age_hours: backup_age.map(|a| (a * 10.0).round() / 10.0),
+        backup_age_hours,
+        consolidation_age_hours: None,
         disk_used_percent: disk.map(|d| d.round()),
         problems,
     }
@@ -139,6 +170,8 @@ mod tests {
             max_disk_percent: 85.0,
             backup_stamp: None,
             max_backup_age_hours: 26.0,
+            consolidation_stamp: None,
+            max_consolidation_age_hours: 30.0,
         }
     }
 
@@ -152,6 +185,7 @@ mod tests {
                 ok: true,
                 notes: Some(3),
                 backup_age_hours: Some(5.0),
+                consolidation_age_hours: None,
                 disk_used_percent: Some(40.0),
                 problems: vec![]
             }
@@ -173,8 +207,18 @@ mod tests {
         let stamp = c.data_dir.join("last-backup");
         std::fs::write(&stamp, format!("{}\n", chrono::Utc::now().to_rfc3339())).unwrap();
         c.backup_stamp = Some(stamp);
-        let (status, Json(report)) = handler(State(Health::new(c))).await;
-        assert_eq!(status, StatusCode::OK, "{report:?}");
+        let consolidated = c.data_dir.join("last-consolidation");
+        let two_days_ago = chrono::Utc::now() - chrono::Duration::hours(48);
+        std::fs::write(&consolidated, two_days_ago.to_rfc3339()).unwrap();
+        c.consolidation_stamp = Some(consolidated.clone());
+        let health = Health::new(c);
+        let (status, Json(report)) = handler(State(health.clone())).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{report:?}");
         assert!(report.backup_age_hours.unwrap() < 0.1);
+        assert_eq!(report.consolidation_age_hours, Some(48.0));
+        assert!(report.problems[0].starts_with("last consolidation was 48.0 hours ago"));
+        std::fs::write(&consolidated, chrono::Utc::now().to_rfc3339()).unwrap();
+        let (status, Json(report)) = handler(State(health)).await;
+        assert_eq!(status, StatusCode::OK, "{report:?}");
     }
 }

@@ -16,6 +16,7 @@ Environment=MEMORY_PUBLIC_URL=https://@DOMAIN@
 Environment=MEMORY_ADDR=@ADDR@:8750
 Environment=MEMORY_ALLOWED_HOSTS=@DOMAIN@
 Environment=MEMORY_BACKUP_STAMP=/var/lib/memory/last-backup
+Environment=MEMORY_CONSOLIDATION_STAMP=/var/lib/memory/last-consolidation
 # Written on POST /dream; memory-dreamer.path watches it.
 Environment=MEMORY_DREAM_TRIGGER=/var/lib/memory/dream-requested
 # Never start on an empty directory if the volume failed to mount.
