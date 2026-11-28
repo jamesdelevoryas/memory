@@ -20,7 +20,8 @@ CREATE TABLE IF NOT EXISTS notes (
   source      TEXT NOT NULL,
   origin      TEXT NOT NULL,
   created_at  TEXT NOT NULL,
-  updated_at  TEXT NOT NULL
+  updated_at  TEXT NOT NULL,
+  review_after TEXT            -- YYYY-MM-DD: the note may be out of date after this
 );
 ";
 
@@ -30,13 +31,17 @@ CREATE INDEX IF NOT EXISTS notes_fts ON notes USING fts (name, description, text
 ";
 
 const COLUMNS: &str = "name, description, text, kind, tags, scope, source, origin, version, \
-    created_at, updated_at";
+    created_at, updated_at, review_after";
 
 const FTS_COLUMNS: &str = "name, description, text";
 
 pub const MAX_NAME_CHARS: usize = 64;
 pub const MAX_DESCRIPTION_CHARS: usize = 150;
 pub const MAX_TEXT_CHARS: usize = 4000;
+
+/// Notes in this scope are seen only by tokens granted it (see auth.rs): health
+/// details, identity documents, other people's private matters.
+pub const PRIVATE_SCOPE: &str = "private";
 
 /// Where a note's content came from, as declared by the agent that wrote it.
 /// Ordered from least to most trusted.
@@ -69,6 +74,10 @@ pub struct Memory {
     pub version: String,
     pub created_at: String,
     pub updated_at: String,
+    /// The date (YYYY-MM-DD) after which the note may be out of date; the index
+    /// flags it once that date has passed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_after: Option<String>,
 }
 
 pub struct NewMemory {
@@ -79,6 +88,8 @@ pub struct NewMemory {
     pub tags: Vec<String>,
     pub scope: String,
     pub origin: Origin,
+    /// None keeps the current note's date when revising; Some(None) clears it.
+    pub review_after: Option<Option<String>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -100,6 +111,8 @@ impl From<turso::Error> for WriteError {
 #[derive(Clone)]
 pub struct Store {
     db: Database,
+    /// Whether this view of the store includes the private scope.
+    private: bool,
 }
 
 impl Store {
@@ -124,7 +137,31 @@ impl Store {
             .await
             .context("creating episode indexes")?;
         drop(conn);
-        Ok(Self { db })
+        add_columns(&db).await.context("adding columns")?;
+        Ok(Self { db, private: true })
+    }
+
+    /// This store as a client sees it: without the private scope unless the
+    /// client's token is granted it. Hidden notes behave as if they didn't exist.
+    pub fn view(&self, private: bool) -> Self {
+        Self {
+            db: self.db.clone(),
+            private: self.private && private,
+        }
+    }
+
+    /// Whether `scope` is visible through this view.
+    fn sees(&self, scope: &str) -> bool {
+        self.private || scope != PRIVATE_SCOPE
+    }
+
+    /// SQL that keeps hidden scopes out of a query on `notes`.
+    fn hidden_filter(&self) -> String {
+        if self.private {
+            String::new()
+        } else {
+            format!(" AND scope != '{PRIVATE_SCOPE}'")
+        }
     }
 
     pub(crate) fn conn(&self) -> Result<turso::Connection> {
@@ -142,13 +179,30 @@ impl Store {
         expected_version: Option<String>,
         source: &str,
     ) -> Result<Memory, WriteError> {
+        let review_after = note.review_after.clone();
         let mut memory = build(note, source).map_err(|e| WriteError::Invalid(format!("{e:#}")))?;
+        if !self.sees(&memory.scope) {
+            return Err(WriteError::Invalid(format!(
+                "this token isn't granted the {PRIVATE_SCOPE} scope; use another scope"
+            )));
+        }
         let mut conn = self.conn()?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .await?;
         let current = by_name(&tx, &memory.name).await?;
         let name = &memory.name;
+        if let Some(cur) = &current
+            && !self.sees(&cur.scope)
+        {
+            return Err(WriteError::Conflict(format!(
+                "the name {name:?} is taken; choose another name"
+            )));
+        }
+        memory.review_after = match review_after {
+            Some(date) => date,
+            None => current.as_ref().and_then(|c| c.review_after.clone()),
+        };
         match (current, expected_version) {
             (None, None) => insert(&tx, &memory).await?,
             (None, Some(_)) => {
@@ -186,7 +240,10 @@ impl Store {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .await?;
-        match by_name(&tx, name).await? {
+        match by_name(&tx, name)
+            .await?
+            .filter(|cur| self.sees(&cur.scope))
+        {
             None => {
                 return Err(WriteError::Conflict(format!(
                     "there is no note named {name:?}"
@@ -219,7 +276,9 @@ impl Store {
     }
 
     pub async fn read(&self, name: &str) -> Result<Option<Memory>> {
-        by_name(&self.conn()?, name).await
+        Ok(by_name(&self.conn()?, name)
+            .await?
+            .filter(|m| self.sees(&m.scope)))
     }
 
     /// Full-text search over names, descriptions, and bodies, best match
@@ -227,7 +286,8 @@ impl Store {
     pub async fn search(&self, query: &str, scopes: &[String], limit: u32) -> Result<Vec<Memory>> {
         let mut sql = format!(
             "SELECT {COLUMNS}, fts_score({FTS_COLUMNS}, ?1) AS score FROM notes \
-             WHERE fts_match({FTS_COLUMNS}, ?1)"
+             WHERE fts_match({FTS_COLUMNS}, ?1){}",
+            self.hidden_filter()
         );
         let mut params = vec![Value::Text(query.to_string())];
         push_scopes(&mut sql, &mut params, scopes);
@@ -240,15 +300,20 @@ impl Store {
         Ok(out)
     }
 
-    /// The index: one line per note, grouped by scope. Only notes stated by
-    /// the user or inferred by an agent are listed; external content stays
-    /// out (memory_list and memory_search still find it).
+    /// The index: one line per note, grouped by scope. Notes from external
+    /// sources (tool output, the web) come last in a section of their own, so
+    /// agents can find them but don't mistake them for what the user said.
+    /// Notes whose review date has passed say so.
     pub async fn index(&self) -> Result<String> {
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let mut rows = self
             .conn()?
             .query(
-                "SELECT scope, name, description, kind FROM notes \
-                 WHERE origin IN ('user_stated', 'agent_inferred') ORDER BY scope, name",
+                format!(
+                    "SELECT scope, name, description, kind, origin, review_after FROM notes \
+                     WHERE 1 = 1{} ORDER BY origin = 'external', scope, name",
+                    self.hidden_filter()
+                ),
                 (),
             )
             .await?;
@@ -256,16 +321,40 @@ impl Store {
         let mut current: Option<String> = None;
         while let Some(row) = rows.next().await? {
             let scope = required(&row, 0)?;
-            if current.as_ref() != Some(&scope) {
-                out.push_str(&format!("\n### {scope}\n"));
-                current = Some(scope);
+            let external = parse_enum::<Origin>(&required(&row, 4)?)? == Origin::External;
+            let heading = if external {
+                "external".to_string()
+            } else {
+                scope.clone()
+            };
+            if current.as_ref() != Some(&heading) {
+                out.push_str(&format!("\n### {heading}\n"));
+                if external {
+                    out.push_str(
+                        "From tool output or the web, not from the user: verify before relying \
+                         on it.\n",
+                    );
+                }
+                current = Some(heading);
             }
             let name = required(&row, 1)?;
             let description = required(&row, 2)?;
-            let kind = text(&row, 3)?
-                .map(|k| format!(" ({k})"))
+            let kind = text(&row, 3)?;
+            let tail = [external.then_some(scope), kind]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+                .join(", ");
+            let tail = if tail.is_empty() {
+                tail
+            } else {
+                format!(" ({tail})")
+            };
+            let due = text(&row, 5)?
+                .filter(|d| *d <= today)
+                .map(|d| format!(" [review due since {d}]"))
                 .unwrap_or_default();
-            out.push_str(&format!("- {name}: {description}{kind}\n"));
+            out.push_str(&format!("- {name}: {description}{tail}{due}\n"));
         }
         Ok(out.trim().to_string())
     }
@@ -279,7 +368,10 @@ impl Store {
         after: Option<&str>,
         limit: u32,
     ) -> Result<Vec<Memory>> {
-        let mut sql = format!("SELECT {COLUMNS} FROM notes WHERE 1 = 1");
+        let mut sql = format!(
+            "SELECT {COLUMNS} FROM notes WHERE 1 = 1{}",
+            self.hidden_filter()
+        );
         let mut params = Vec::new();
         if let Some(since) = since {
             params.push(Value::Text(since.to_string()));
@@ -349,6 +441,30 @@ async fn migrate(conn: &turso::Connection) -> Result<()> {
     Ok(())
 }
 
+/// Adds columns that databases from before them lack; a new database gets them
+/// from TABLES. The ALTER runs on a fresh connection: in turso 0.7.2, an ALTER
+/// TABLE on a connection that has read pragma_table_info silently doesn't stick.
+async fn add_columns(db: &Database) -> Result<()> {
+    let columns = {
+        let conn = db.connect()?;
+        let mut rows = conn
+            .query("SELECT name FROM pragma_table_info('notes')", ())
+            .await?;
+        let mut columns = Vec::new();
+        while let Some(row) = rows.next().await? {
+            columns.push(required(&row, 0)?);
+        }
+        columns
+    };
+    if !columns.iter().any(|c| c == "review_after") {
+        tracing::info!("adding notes.review_after");
+        db.connect()?
+            .execute("ALTER TABLE notes ADD COLUMN review_after TEXT", ())
+            .await?;
+    }
+    Ok(())
+}
+
 async fn by_name(conn: &turso::Connection, name: &str) -> Result<Option<Memory>> {
     let mut rows = conn
         .query(
@@ -393,6 +509,11 @@ fn build(new: NewMemory, source: &str) -> Result<Memory> {
     if scope.is_empty() {
         bail!("scope must not be empty");
     }
+    if let Some(Some(date)) = &new.review_after
+        && chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d").is_err()
+    {
+        bail!("review_after must be a date like 2026-12-31: {date:?}");
+    }
     let now = now();
     Ok(Memory {
         name,
@@ -409,6 +530,7 @@ fn build(new: NewMemory, source: &str) -> Result<Memory> {
         version: uuid::Uuid::now_v7().to_string(),
         created_at: now.clone(),
         updated_at: now,
+        review_after: new.review_after.flatten(),
     })
 }
 
@@ -425,14 +547,15 @@ fn values(m: &Memory) -> Vec<Value> {
         Value::Text(enum_str(&m.origin)),
         Value::Text(m.created_at.clone()),
         Value::Text(m.updated_at.clone()),
+        opt_text(m.review_after.clone()),
     ]
 }
 
 async fn insert(conn: &turso::Connection, m: &Memory) -> Result<()> {
     conn.execute(
         "INSERT INTO notes (name, version, description, text, kind, tags, scope, source, origin,
-                            created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                            created_at, updated_at, review_after)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         values(m),
     )
     .await?;
@@ -442,7 +565,8 @@ async fn insert(conn: &turso::Connection, m: &Memory) -> Result<()> {
 async fn update(conn: &turso::Connection, m: &Memory) -> Result<()> {
     conn.execute(
         "UPDATE notes SET version = ?2, description = ?3, text = ?4, kind = ?5, tags = ?6,
-                          scope = ?7, source = ?8, origin = ?9, created_at = ?10, updated_at = ?11
+                          scope = ?7, source = ?8, origin = ?9, created_at = ?10, updated_at = ?11,
+                          review_after = ?12
          WHERE name = ?1",
         values(m),
     )
@@ -514,6 +638,7 @@ fn row_to_memory(row: &turso::Row) -> Result<Memory> {
         version: required(row, 8)?,
         created_at: required(row, 9)?,
         updated_at: required(row, 10)?,
+        review_after: text(row, 11)?,
     })
 }
 
@@ -530,6 +655,7 @@ mod tests {
             tags: vec!["Rust".into(), " rust ".into(), "".into()],
             scope: scope.into(),
             origin,
+            review_after: None,
         }
     }
 
@@ -744,7 +870,7 @@ mod tests {
         }
         assert_eq!(
             store.index().await?,
-            "### personal\n- prefers-rust: about prefers-rust (user)\n\n### work\n- deploy-target: about deploy-target (user)"
+            "### personal\n- prefers-rust: about prefers-rust (user)\n\n### work\n- deploy-target: about deploy-target (user)\n\n### external\nFrom tool output or the web, not from the user: verify before relying on it.\n- from-web: about from-web (work, user)"
         );
         for i in 0..100 {
             store
@@ -757,6 +883,153 @@ mod tests {
         }
         let index = store.index().await?;
         assert!(index.contains("- n-000:") && index.contains("- n-099:"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn review_after_is_kept_flagged_and_cleared() -> Result<()> {
+        let (store, _) = temp_store().await?;
+        let mut trip = note("trip", "flying out", "personal", Origin::UserStated);
+        trip.review_after = Some(Some("2020-01-31".into()));
+        let m = store.write(trip, None, "t").await?;
+        assert_eq!(m.review_after.as_deref(), Some("2020-01-31"));
+        let mut later = note("later", "x", "personal", Origin::UserStated);
+        later.review_after = Some(Some("2999-01-01".into()));
+        store.write(later, None, "t").await?;
+        let index = store.index().await?;
+        assert!(index.contains("- trip: about trip (user) [review due since 2020-01-31]"));
+        assert!(
+            index.contains("- later: about later (user)\n")
+                || index.ends_with("- later: about later (user)")
+        );
+
+        // Revising without the field keeps the date; an explicit None clears it.
+        let kept = store
+            .write(
+                note("trip", "flew out", "personal", Origin::UserStated),
+                Some(m.version),
+                "t",
+            )
+            .await?;
+        assert_eq!(kept.review_after.as_deref(), Some("2020-01-31"));
+        let mut clear = note("trip", "flew out", "personal", Origin::UserStated);
+        clear.review_after = Some(None);
+        let cleared = store.write(clear, Some(kept.version), "t").await?;
+        assert_eq!(cleared.review_after, None);
+        assert_eq!(store.read("trip").await?.unwrap().review_after, None);
+
+        let mut bad = note("bad", "x", "personal", Origin::UserStated);
+        bad.review_after = Some(Some("next week".into()));
+        assert!(matches!(
+            store.write(bad, None, "t").await,
+            Err(WriteError::Invalid(_))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn private_scope_is_hidden_without_the_grant() -> Result<()> {
+        let (store, _) = temp_store().await?;
+        let secret = store
+            .write(
+                note("dob", "born then", PRIVATE_SCOPE, Origin::UserStated),
+                None,
+                "t",
+            )
+            .await?;
+        store
+            .write(
+                note("open", "born then too", "personal", Origin::UserStated),
+                None,
+                "t",
+            )
+            .await?;
+        let limited = store.view(false);
+        assert!(limited.read("dob").await?.is_none());
+        assert!(store.view(true).read("dob").await?.is_some());
+        let found: Vec<String> = limited
+            .search("born", &[], 10)
+            .await?
+            .into_iter()
+            .map(|m| m.name)
+            .collect();
+        assert_eq!(found, ["open"]);
+        assert!(!limited.index().await?.contains("dob"));
+        assert!(store.index().await?.contains("### private\n- dob:"));
+        assert_eq!(limited.list(None, &[], None, 10).await?.len(), 1);
+        // It can't create, revise, take over, or forget private notes.
+        assert!(matches!(
+            limited
+                .write(
+                    note("new", "x", PRIVATE_SCOPE, Origin::UserStated),
+                    None,
+                    "t"
+                )
+                .await,
+            Err(WriteError::Invalid(_))
+        ));
+        assert!(matches!(
+            limited
+                .write(
+                    note("dob", "x", "personal", Origin::UserStated),
+                    Some(secret.version.clone()),
+                    "t"
+                )
+                .await,
+            Err(WriteError::Conflict(_))
+        ));
+        assert!(matches!(
+            limited.forget("dob", &secret.version).await,
+            Err(WriteError::Conflict(_))
+        ));
+        // A limited view of a limited view stays limited.
+        assert!(limited.view(true).read("dob").await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn adds_review_after_to_an_existing_database() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("memory-test-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("t.db");
+        {
+            let db = Builder::new_local(path.to_str().unwrap())
+                .experimental_index_method(true)
+                .build()
+                .await?;
+            let conn = db.connect()?;
+            conn.execute_batch(
+                "CREATE TABLE notes (name TEXT PRIMARY KEY, version TEXT NOT NULL,
+                   description TEXT NOT NULL, text TEXT NOT NULL, kind TEXT, tags TEXT,
+                   scope TEXT NOT NULL, source TEXT NOT NULL, origin TEXT NOT NULL,
+                   created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+                 CREATE INDEX notes_fts ON notes USING fts (name, description, text)
+                   WITH (weights = 'name=2.0,description=2.0,text=1.0');
+                 INSERT INTO notes VALUES ('old', 'v1', 'an old note', 'old text about penguins',
+                   NULL, NULL, 'personal', 'x', 'user_stated', '2026-09-01T00:00:00.000Z',
+                   '2026-09-01T00:00:00.000Z');",
+            )
+            .await?;
+        }
+        let store = Store::open(path.to_str().unwrap()).await?;
+        let old = store.read("old").await?.unwrap();
+        assert_eq!(old.review_after, None);
+        assert_eq!(store.search("penguins", &[], 10).await?.len(), 1);
+        let mut revised = note(
+            "old",
+            "new text about penguins",
+            "personal",
+            Origin::UserStated,
+        );
+        revised.review_after = Some(Some("2027-01-01".into()));
+        store.write(revised, Some(old.version), "t").await?;
+        assert_eq!(store.search("penguins", &[], 10).await?.len(), 1);
+        drop(store);
+        let again = Store::open(path.to_str().unwrap()).await?;
+        assert_eq!(
+            again.read("old").await?.unwrap().review_after.as_deref(),
+            Some("2027-01-01")
+        );
         Ok(())
     }
 
