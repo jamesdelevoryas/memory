@@ -136,6 +136,128 @@ fn flatten(content: &Value) -> String {
     }
 }
 
+/// What the first lines of a Codex rollout file say about its session.
+pub struct CodexMeta {
+    pub session: String,
+    pub cwd: Option<String>,
+    /// Codex copies other agents' sessions (Claude Code's) into rollout files
+    /// of its own; those are already uploaded by their own client.
+    pub imported: bool,
+}
+
+/// Reads a Codex rollout's `session_meta` and first turn from its first lines.
+pub fn codex_meta(first_lines: &str) -> Option<CodexMeta> {
+    let mut meta: Option<CodexMeta> = None;
+    for line in first_lines.lines().take(20) {
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let p = &v["payload"];
+        match (v["type"].as_str(), p["type"].as_str()) {
+            (Some("session_meta"), _) => {
+                meta = Some(CodexMeta {
+                    session: p["id"].as_str().or(p["session_id"].as_str())?.to_string(),
+                    cwd: p["cwd"].as_str().map(str::to_string),
+                    imported: p["history_mode"] == "legacy" && p["thread_source"].is_null(),
+                });
+            }
+            (Some("event_msg"), Some("task_started")) => {
+                let imported = p["turn_id"]
+                    .as_str()
+                    .is_some_and(|t| t.starts_with("external-import"));
+                if let Some(m) = &mut meta {
+                    m.imported |= imported;
+                }
+                break;
+            }
+            _ => {}
+        }
+    }
+    meta
+}
+
+/// Parses complete lines of a Codex rollout file
+/// (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`), the first of which starts
+/// at byte `base` of the file. Newer files record each finished item
+/// (`item_completed`, keyed by the item's id); older ones record messages as
+/// `user_message` and `agent_message` events, keyed by their offset.
+pub fn codex(lines: &str, base: u64) -> Vec<NewEpisode> {
+    let mut out = Vec::new();
+    let mut offset = base;
+    for line in lines.split_inclusive('\n') {
+        let at_offset = offset;
+        offset += line.len() as u64;
+        let Ok(v) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(at) = v["timestamp"].as_str() else {
+            continue;
+        };
+        let p = &v["payload"];
+        if v["type"] != "event_msg" {
+            continue;
+        }
+        let found = match p["type"].as_str() {
+            Some("item_completed") => codex_item(&p["item"]),
+            Some("user_message") => p["message"]
+                .as_str()
+                .and_then(|m| spoken(Role::User, m))
+                .map(|e| (format!("@{at_offset}"), e)),
+            Some("agent_message") => p["message"]
+                .as_str()
+                .and_then(|m| spoken(Role::Assistant, m))
+                .map(|e| (format!("@{at_offset}"), e)),
+            _ => None,
+        };
+        if let Some((key, (role, text))) = found
+            && !text.trim().is_empty()
+        {
+            out.push(episode(key, role, text, at));
+        }
+    }
+    out
+}
+
+/// One finished item of a Codex turn: what was said, or a short line for a
+/// tool call. Reasoning is dropped.
+fn codex_item(item: &Value) -> Option<(String, (Role, String))> {
+    let id = item["id"].as_str()?.to_string();
+    let texts = || {
+        item["content"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|c| c["text"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let found = match item["type"].as_str()? {
+        "UserMessage" => spoken(Role::User, &texts()),
+        "AgentMessage" => spoken(Role::Assistant, &texts()),
+        "Reasoning" => None,
+        "McpToolCall" => Some((
+            Role::Tool,
+            format!(
+                "[{}.{}] {}\n{}",
+                item["server"].as_str().unwrap_or("mcp"),
+                item["tool"].as_str().unwrap_or("tool"),
+                item["arguments"],
+                item["result"]
+            ),
+        )),
+        "CommandExecution" => Some((
+            Role::Tool,
+            format!(
+                "[exec] {}\n{}",
+                item["command"],
+                item["aggregated_output"].as_str().unwrap_or_default()
+            ),
+        )),
+        other => Some((Role::Tool, format!("[{other}] {item}"))),
+    };
+    found.map(|f| (id, f))
+}
+
 /// Parses `conversations.json` from a claude.ai data export (Settings →
 /// Privacy → Export data) into one upload per conversation, in order.
 pub fn claude_ai_export(json: &str) -> Result<Vec<Upload>> {
@@ -291,5 +413,51 @@ mod tests {
         );
         assert!(claude_ai_export("{}").is_err());
         Ok(())
+    }
+
+    #[test]
+    fn codex_keeps_the_conversation_and_spots_imports() {
+        let lines = [
+            r#"{"timestamp":"2026-11-08T01:10:08Z","type":"session_meta","payload":{"session_id":"s1","id":"s1","cwd":"/Users/p/code","history_mode":"paginated","thread_source":"user"}}"#,
+            r#"{"timestamp":"2026-11-08T01:10:08Z","type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}"#,
+            r#"{"timestamp":"2026-11-08T01:10:09Z","type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"You are Codex"}]}}"#,
+            r#"{"timestamp":"2026-11-08T01:10:09Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"UserMessage","id":"i1","content":[{"type":"text","text":"how is the transcript rendered?\n"}]}}}"#,
+            r#"{"timestamp":"2026-11-08T01:10:10Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"Reasoning","id":"i2","summary_text":[]}}}"#,
+            r#"{"timestamp":"2026-11-08T01:10:11Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"McpToolCall","id":"i3","server":"memory","tool":"memory_index","arguments":{},"result":"ok"}}}"#,
+            r#"{"timestamp":"2026-11-08T01:10:12Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","id":"i4","command":["ls"],"aggregated_output":"src\n"}}}"#,
+            r#"{"timestamp":"2026-11-08T01:10:13Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","id":"i5","content":[{"type":"Text","text":"A summary, not a dump."}],"phase":"final_answer"}}}"#,
+            r#"{"timestamp":"2026-11-08T01:10:14Z","type":"event_msg","payload":{"type":"user_message","message":"older format"}}"#,
+            r#"{"timestamp":"2026-11-08T01:10:14Z","type":"event_msg","payload":{"type":"token_count"}}"#,
+        ]
+        .join("\n")
+            + "\n";
+        let meta = codex_meta(&lines).unwrap();
+        assert_eq!(
+            (meta.session.as_str(), meta.cwd.as_deref(), meta.imported),
+            ("s1", Some("/Users/p/code"), false)
+        );
+        let episodes = codex(&lines, 100);
+        let got: Vec<(&str, Role, &str)> = episodes
+            .iter()
+            .map(|e| (e.key.as_str(), e.role, e.text.as_str()))
+            .collect();
+        let older = format!("@{}", 100 + lines.find(r#"{"timestamp":"2026-11-08T01:10:14Z","type":"event_msg","payload":{"type":"user_message""#).unwrap());
+        assert_eq!(
+            got,
+            vec![
+                ("i1", Role::User, "how is the transcript rendered?"),
+                ("i3", Role::Tool, "[memory.memory_index] {}\n\"ok\""),
+                ("i4", Role::Tool, "[exec] [\"ls\"]\nsrc\n"),
+                ("i5", Role::Assistant, "A summary, not a dump."),
+                (older.as_str(), Role::User, "older format"),
+            ]
+        );
+
+        let imported = [
+            r#"{"timestamp":"2026-11-08T01:09:22Z","type":"session_meta","payload":{"id":"s2","cwd":"/Users/p","history_mode":"legacy"}}"#,
+            r#"{"timestamp":"2026-11-08T01:09:22Z","type":"event_msg","payload":{"type":"task_started","turn_id":"external-import-turn-1"}}"#,
+        ]
+        .join("\n");
+        assert!(codex_meta(&imported).unwrap().imported);
     }
 }

@@ -93,13 +93,108 @@ pub struct HookInput {
     pub transcript_path: PathBuf,
 }
 
+/// What a Codex hook sends on stdin; either field may be missing.
+#[derive(Deserialize, Default)]
+pub struct CodexHookInput {
+    pub session_id: Option<String>,
+    pub transcript_path: Option<PathBuf>,
+}
+
 /// Uploads the lines added to a Claude Code session file since the last
 /// upload, remembering how far it got in a state file. Returns the number of
 /// episodes the server added.
 pub fn upload_claude_code(remote: &Remote, path: &Path, session: &str) -> Result<u64> {
-    let state = state_dir()?
-        .join("claude-code")
-        .join(format!("{session}.offset"));
+    upload_new_lines(remote, path, session, "claude-code", |text, _| {
+        let parsed = transcripts::claude_code(text);
+        (parsed.episodes, parsed.cwd.map(|cwd| home_relative(&cwd)))
+    })
+}
+
+/// Uploads the new turns of a Codex rollout file; files Codex imported from
+/// other agents are skipped. Returns the number of episodes the server added.
+pub fn upload_codex(remote: &Remote, path: &Path) -> Result<u64> {
+    let Some(meta) = codex_meta(path)? else {
+        return Ok(0);
+    };
+    if meta.imported {
+        return Ok(0);
+    }
+    let title = meta.cwd.map(|cwd| home_relative(&cwd));
+    upload_new_lines(remote, path, &meta.session, "codex", |text, base| {
+        (transcripts::codex(text, base), title.clone())
+    })
+}
+
+fn codex_meta(path: &Path) -> Result<Option<transcripts::CodexMeta>> {
+    use std::io::BufRead;
+    let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut first = String::new();
+    for line in std::io::BufReader::new(file).lines().take(20) {
+        let line = line?;
+        let started = line.contains(r#""task_started""#);
+        first.push_str(&line);
+        first.push('\n');
+        if started {
+            break;
+        }
+    }
+    Ok(transcripts::codex_meta(&first))
+}
+
+/// The rollout file of the Codex session `session`, if there is one.
+pub fn find_codex_session(session: &str) -> Result<Option<PathBuf>> {
+    Ok(codex_rollouts()?.into_iter().find(|p| {
+        p.file_stem()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.ends_with(session))
+    }))
+}
+
+/// Every Codex rollout file written to recently.
+pub fn recent_codex_sessions() -> Result<Vec<PathBuf>> {
+    let since = SystemTime::now() - RECENT;
+    let mut out = Vec::new();
+    for path in codex_rollouts()? {
+        if path.metadata()?.modified()? >= since {
+            out.push(path);
+        }
+    }
+    Ok(out)
+}
+
+/// `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`, or none if Codex isn't used here.
+fn codex_rollouts() -> Result<Vec<PathBuf>> {
+    fn walk(dir: &Path, depth: u32, out: &mut Vec<PathBuf>) -> Result<()> {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return Ok(());
+        };
+        for entry in entries {
+            let path = entry?.path();
+            if depth < 3 && path.is_dir() {
+                walk(&path, depth + 1, out)?;
+            } else if path.extension().is_some_and(|e| e == "jsonl") {
+                out.push(path);
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(&home()?.join(".codex").join("sessions"), 0, &mut out)?;
+    Ok(out)
+}
+
+/// Uploads the lines added to a session file since the last upload,
+/// remembering how far it got in a state file under `kind`. `parse` gets the
+/// new complete lines and the byte offset they start at, and returns their
+/// episodes and the session's title.
+fn upload_new_lines(
+    remote: &Remote,
+    path: &Path,
+    session: &str,
+    kind: &str,
+    parse: impl Fn(&str, u64) -> (Vec<crate::episodes::NewEpisode>, Option<String>),
+) -> Result<u64> {
+    let state = state_dir()?.join(kind).join(format!("{session}.offset"));
     let mut offset: u64 = std::fs::read_to_string(&state)
         .ok()
         .and_then(|s| s.trim().parse().ok())
@@ -117,10 +212,9 @@ pub fn upload_claude_code(remote: &Remote, path: &Path, session: &str) -> Result
     let Some(end) = bytes.iter().rposition(|&b| b == b'\n').map(|i| i + 1) else {
         return Ok(0);
     };
-    let parsed = transcripts::claude_code(&String::from_utf8_lossy(&bytes[..end]));
-    let title = parsed.cwd.map(|cwd| home_relative(&cwd));
+    let (episodes, title) = parse(&String::from_utf8_lossy(&bytes[..end]), offset);
     let mut added = 0;
-    for batch in parsed.episodes.chunks(MAX_UPLOAD_EPISODES) {
+    for batch in episodes.chunks(MAX_UPLOAD_EPISODES) {
         let up = remote.upload(&Upload {
             session: session.to_string(),
             title: title.clone(),

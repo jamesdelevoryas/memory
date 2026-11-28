@@ -27,6 +27,8 @@ usage:
 client commands (talk to a running server):
   memory upload claude-code            upload new turns of the session a Claude Code hook names on stdin
   memory upload claude-code --recent   upload new turns of every Claude Code session from the last day
+  memory upload codex                  upload new turns of the session a Codex hook names on stdin
+  memory upload codex --recent         upload new turns of every Codex session from the last day
   memory import claude-ai <conversations.json>  import a claude.ai data export
   memory pending                       exit 0 if conversations are waiting for the dreamer, 1 if not
   memory dream                         ask the server to run the dreamer now
@@ -96,6 +98,40 @@ async fn main() -> Result<()> {
             let mut added = 0;
             for (path, session) in client::recent_claude_code_sessions()? {
                 added += client::upload_claude_code(&remote, &path, &session)
+                    .with_context(|| format!("uploading {}", path.display()))?;
+            }
+            eprintln!("added {added} episodes");
+            Ok(())
+        }
+        ["upload", "codex"] => {
+            let mut input = String::new();
+            std::io::stdin().read_to_string(&mut input)?;
+            let hook: client::CodexHookInput = serde_json::from_str(&input).unwrap_or_default();
+            let path = match (hook.transcript_path, hook.session_id) {
+                (Some(path), _) => Some(path),
+                (None, Some(session)) => client::find_codex_session(&session)?,
+                (None, None) => None,
+            };
+            let remote = client::Remote::from_env()?;
+            match path {
+                Some(path) => {
+                    client::upload_codex(&remote, &path)?;
+                }
+                // Nothing says which session: upload whatever changed lately.
+                None => {
+                    for path in client::recent_codex_sessions()? {
+                        client::upload_codex(&remote, &path)
+                            .with_context(|| format!("uploading {}", path.display()))?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        ["upload", "codex", "--recent"] => {
+            let remote = client::Remote::from_env()?;
+            let mut added = 0;
+            for path in client::recent_codex_sessions()? {
+                added += client::upload_codex(&remote, &path)
                     .with_context(|| format!("uploading {}", path.display()))?;
             }
             eprintln!("added {added} episodes");
