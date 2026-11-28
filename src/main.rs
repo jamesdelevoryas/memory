@@ -19,13 +19,16 @@ use tokio::signal::unix::{SignalKind, signal};
 const USAGE: &str = "\
 usage:
   memory serve                     run the MCP server
-  memory token <source> <level>    mint a client token (level: read, add, consolidate)
+  memory token <source> <level> [private]  mint a client token (level: read, add, consolidate;
+                                   private also grants the private scope and transcripts)
   memory oauth-client <client-id> [redirect-uri...]
                                    mint a pre-registered OAuth client and its secret
 
 client commands (talk to a running server):
   memory upload claude-code            upload new turns of the session a Claude Code hook names on stdin
   memory upload claude-code --recent   upload new turns of every Claude Code session from the last day
+  memory upload codex                  upload new turns of the session a Codex hook names on stdin
+  memory upload codex --recent         upload new turns of every Codex session from the last day
   memory import claude-ai <conversations.json>  import a claude.ai data export
   memory pending                       exit 0 if conversations are waiting for the dreamer, 1 if not
   memory dream                         ask the server to run the dreamer now
@@ -40,6 +43,8 @@ server environment:
   MEMORY_EPISODE_RETENTION_DAYS  drop distilled transcripts older than this; 0 keeps them (default: 90)
   MEMORY_QUIET_MINUTES  how long a conversation must be idle before the dreamer reads it (default: 5)
   MEMORY_DREAM_TRIGGER  file to write when a client asks for a dreamer run (default: none)
+  MEMORY_BACKUP_STAMP   file holding the last backup's time, for /health (default: none)
+  MEMORY_CONSOLIDATION_STAMP  file holding the last consolidation's time, for /health (default: none)
 
 client environment:
   MEMORY_URL            the server's base URL, e.g. https://memory.example.com
@@ -57,15 +62,16 @@ async fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
         ["serve"] => serve().await,
-        ["token", source, level] => {
+        ["token", source, level, ref grant @ ..] if matches!(grant, [] | ["private"]) => {
             let _: auth::Level = level.parse()?;
             if source.is_empty() || source.contains(char::is_whitespace) {
                 bail!("source must be a single word, e.g. claude-code");
             }
             let token = auth::generate();
+            let grant = grant.iter().map(|g| format!(" {g}")).collect::<String>();
             eprintln!("Token (give this to the client; it is not stored):\n{token}\n");
             eprintln!("Append this line to the tokens file:");
-            println!("{} {source} {level}", auth::hash(&token));
+            println!("{} {source} {level}{grant}", auth::hash(&token));
             Ok(())
         }
         ["oauth-client", id, ref redirects @ ..] => {
@@ -92,6 +98,40 @@ async fn main() -> Result<()> {
             let mut added = 0;
             for (path, session) in client::recent_claude_code_sessions()? {
                 added += client::upload_claude_code(&remote, &path, &session)
+                    .with_context(|| format!("uploading {}", path.display()))?;
+            }
+            eprintln!("added {added} episodes");
+            Ok(())
+        }
+        ["upload", "codex"] => {
+            let mut input = String::new();
+            std::io::stdin().read_to_string(&mut input)?;
+            let hook: client::CodexHookInput = serde_json::from_str(&input).unwrap_or_default();
+            let path = match (hook.transcript_path, hook.session_id) {
+                (Some(path), _) => Some(path),
+                (None, Some(session)) => client::find_codex_session(&session)?,
+                (None, None) => None,
+            };
+            let remote = client::Remote::from_env()?;
+            match path {
+                Some(path) => {
+                    client::upload_codex(&remote, &path)?;
+                }
+                // Nothing says which session: upload whatever changed lately.
+                None => {
+                    for path in client::recent_codex_sessions()? {
+                        client::upload_codex(&remote, &path)
+                            .with_context(|| format!("uploading {}", path.display()))?;
+                    }
+                }
+            }
+            Ok(())
+        }
+        ["upload", "codex", "--recent"] => {
+            let remote = client::Remote::from_env()?;
+            let mut added = 0;
+            for path in client::recent_codex_sessions()? {
+                added += client::upload_codex(&remote, &path)
                     .with_context(|| format!("uploading {}", path.display()))?;
             }
             eprintln!("added {added} episodes");
@@ -153,6 +193,10 @@ async fn serve() -> Result<()> {
         max_disk_percent: env("MEMORY_DISK_MAX_PERCENT", "85").parse()?,
         backup_stamp: std::env::var("MEMORY_BACKUP_STAMP").ok().map(PathBuf::from),
         max_backup_age_hours: env("MEMORY_BACKUP_MAX_AGE_HOURS", "26").parse()?,
+        consolidation_stamp: std::env::var("MEMORY_CONSOLIDATION_STAMP")
+            .ok()
+            .map(PathBuf::from),
+        max_consolidation_age_hours: env("MEMORY_CONSOLIDATION_MAX_AGE_HOURS", "30").parse()?,
     });
     let settings = ingest::Settings {
         retention_days: env("MEMORY_EPISODE_RETENTION_DAYS", "90").parse()?,

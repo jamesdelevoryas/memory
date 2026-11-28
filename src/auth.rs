@@ -1,5 +1,7 @@
 //! Bearer-token auth. Each client gets its own token; the tokens file stores
-//! only SHA-256 hashes, one client per line: `<sha256-hex> <source> <level>`.
+//! only SHA-256 hashes, one client per line: `<sha256-hex> <source> <level>
+//! [private]`. The optional `private` grant lets the client see notes in the
+//! private scope and read past conversations, which can hold the same details.
 
 use std::{
     collections::HashMap,
@@ -40,6 +42,8 @@ impl std::str::FromStr for Level {
 pub struct Client {
     pub source: String,
     pub level: Level,
+    /// Granted the private scope and transcripts.
+    pub private: bool,
 }
 
 /// The tokens file, loaded at startup and reloadable (on SIGHUP) without a
@@ -81,16 +85,19 @@ fn parse(path: &Path) -> Result<HashMap<String, Client>> {
             continue;
         }
         let fields: Vec<&str> = line.split_whitespace().collect();
-        let [hash, source, level] = fields[..] else {
-            bail!(
-                "{}:{}: expected `<sha256> <source> <level>`",
+        let (hash, source, level, private) = match fields[..] {
+            [hash, source, level] => (hash, source, level, false),
+            [hash, source, level, "private"] => (hash, source, level, true),
+            _ => bail!(
+                "{}:{}: expected `<sha256> <source> <level> [private]`",
                 path.display(),
                 n + 1
-            );
+            ),
         };
         let client = Client {
             source: source.to_string(),
             level: level.parse()?,
+            private,
         };
         if map.insert(hash.to_lowercase(), client).is_some() {
             bail!("{}:{}: duplicate token hash", path.display(), n + 1);
@@ -182,6 +189,18 @@ mod tests {
         )?;
         assert_eq!(tokens.reload()?, 2);
         assert_eq!(tokens.lookup("t2").unwrap().level, Level::Read);
+        assert!(!tokens.lookup("t2").unwrap().private);
+
+        std::fs::write(
+            &path,
+            format!(
+                "{} first add private\n{} second read\n",
+                hash("t1"),
+                hash("t2")
+            ),
+        )?;
+        tokens.reload()?;
+        assert!(tokens.lookup("t1").unwrap().private);
 
         // A broken file is rejected and the previous tokens stay in effect.
         std::fs::write(&path, "not a valid line\n")?;

@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the memory consolidator nightly
+
+[Timer]
+OnCalendar=*-*-* 03:00:00 America/Los_Angeles
+# Catch up after the VM was down at 3am.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

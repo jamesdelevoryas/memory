@@ -26,11 +26,14 @@ Its hostname lives in `deploy/config` (untracked; copy `deploy/config.example`),
 - Deploy: `deploy/deploy.sh` (rsyncs source, builds on the VM, installs, restarts). Restarts don't interrupt clients:
   the server is session-less (like MCP 2026-07-28), finishes in-flight requests on SIGTERM, and Caddy holds new
   requests for up to 15s while it comes back.
-- Tokens: `deploy/token.sh <source> <read|add|consolidate>` mints a token on the server (which stores only its
+- Tokens: `deploy/token.sh <source> <read|add|consolidate> [private]` mints a token on the server (which stores only its
   hash), reloads the tokens file (`systemctl reload memory`, no restart), and saves the token in the macOS keychain (`memory-mcp-token` / `<source>`). Revoke by
-  deleting the line from `/etc/memory/tokens` and running `systemctl reload memory`.
+  deleting the line from `/etc/memory/tokens` and running `systemctl reload memory`. A token without `private`
+  doesn't see notes in the private scope or past conversations (see [Notes](#notes)); to grant it later, append
+  ` private` to its line and reload.
 - Health: `GET /health` (no auth) returns 200 when the database answers, the last backup is under 26 hours old,
-  and the disk is under 85% full; otherwise 503 with the problems. It's meant for an external monitor.
+  the last consolidation is under 30 hours old, and the disk is under 85% full; otherwise 503 with the problems.
+  It's meant for an external monitor.
 - Inspect: `deploy/inspect.sh` opens a fresh snapshot of the production DB in `tursodb` (plain `sqlite3` can't read
   the FTS index); `deploy/inspect.sh "SELECT ..."` runs one query. The server stops for about a second while it copies.
 - Backups: `memory-backup.timer` runs nightly at 03:30 UTC. It stops the server for a few seconds, then pushes a
@@ -42,14 +45,36 @@ Its hostname lives in `deploy/config` (untracked; copy `deploy/config.example`),
   copy `/etc/memory/{tokens,backup.env,backup_key}` and `/etc/memory-dreamer/env` over, stop `memory` on the old server, move the volume, reboot the
   new server so it mounts, and run `deploy/deploy.sh`.
 
+## Notes
+
+Notes are grouped by scope: `personal`, `work`, `health`, `agent`, and `private`. The private scope
+holds what shouldn't reach every app: identity documents and numbers, address, payment details,
+sexual health, other people's private matters. Only tokens granted `private` see it, and only they
+can search or read past conversations, which hold the same details.
+
+The index lists every note visible to the caller. Notes from external sources (tool output, the
+web) come last under their own heading, so agents can follow links to them without mistaking them
+for what you said. A note can carry a `review_after` date (trips, appointments, plans); once it
+passes, the index marks the note `[review due since ...]` until someone updates it.
+
 ## Consolidation
 
-A nightly scheduled agent keeps memory tidy: it reads every note with
-`memory_list`, merges overlaps, fixes contradictions and stale facts, and
-tightens descriptions, then reports what it changed. Its prompt is
-[`consolidator.md`](consolidator.md); run it from any client with a
-`consolidate` token (here, a claude.ai scheduled task). Notes are edited in
-place with no history; the nightly backups are the way back.
+A nightly agent keeps memory tidy: it reads every note with `memory_list`, merges overlaps, fixes
+contradictions, retires notes past their review date, narrows preferences that were generalized from
+one remark, splits notes that mix your words with research, moves sensitive details into the
+private scope, and tightens descriptions, then reports what it changed. Its prompt is
+[`consolidator.md`](consolidator.md). It runs on the memory server at 3:00 AM Pacific
+(`memory-consolidator.timer`), as the dreamer's user with the same Claude Code login, on Opus, under
+its own token; each run writes `/var/lib/memory/last-consolidation`, and `/health` fails once that's
+30 hours old. Set it up once, after the dreamer:
+
+```sh
+deploy/consolidator-setup.sh                             # mints its token, enables the timer
+ssh root@<server> systemctl start memory-consolidator    # run it now
+ssh root@<server> journalctl -u memory-consolidator      # each run's report
+```
+
+Notes are edited in place with no history; the nightly backups are the way back.
 
 ## Connecting clients
 
@@ -58,7 +83,7 @@ Every client authenticates the same way: its own bearer token, sent as an
 client (that name becomes the `source` on everything it writes):
 
 ```sh
-deploy/token.sh claude-ai consolidate   # or read / add
+deploy/token.sh claude-ai consolidate private   # or read / add; private for your own apps
 security find-generic-password -s memory-mcp-token -a claude-ai -w | pbcopy
 ```
 
@@ -68,6 +93,9 @@ security find-generic-password -s memory-mcp-token -a claude-ai -w | pbcopy
 claude mcp add --scope user --transport http memory https://memory.example.com/mcp \
   --header "Authorization: Bearer <token>"
 ```
+
+Then give it a timeout in `~/.claude.json` (`"timeout": 30000` in the `memory` entry under
+`mcpServers`), so a dropped connection fails a call after 30 seconds instead of stalling the session.
 
 ### claude.ai
 
@@ -146,6 +174,24 @@ under `~/.local/state/memory`). `SessionStart` catches up every session written 
 and asks for a dreamer run. The token is the keychain entry `deploy/token.sh` saved; uploading
 needs `add`.
 
+### Codex: hooks
+
+Codex reads the same hook format from `~/.codex/hooks.json`:
+
+```json
+{
+  "hooks": {
+    "Stop": [{ "hooks": [{ "type": "command", "timeout": 30,
+      "command": "MEMORY_URL=https://memory.example.com MEMORY_TOKEN=$(security find-generic-password -s memory-mcp-token -a codex -w) ~/.cargo/bin/memory upload codex" }] }],
+    "SessionStart": [{ "hooks": [{ "type": "command", "timeout": 60,
+      "command": "export MEMORY_URL=https://memory.example.com MEMORY_TOKEN=$(security find-generic-password -s memory-mcp-token -a codex -w); ~/.cargo/bin/memory upload codex --recent; ~/.cargo/bin/memory dream 2>/dev/null || true" }] }]
+  }
+}
+```
+
+`memory upload codex` reads Codex's rollout files under `~/.codex/sessions`. It skips the sessions
+Codex imports from Claude Code, which Claude Code's own hook uploads.
+
 ### claude.ai: logging turns, plus the export
 
 claude.ai has no hooks, so the model logs its own turns with `memory_log_turn`. The server's
@@ -157,11 +203,14 @@ preferences:
 > one it returns.
 
 The model can skip turns or paraphrase, so these turns are never trusted as your own words. For an
-exact copy, export your data now and then (Settings → Privacy → Export data), unzip it, and import
-`conversations.json` with its own token; re-importing skips what's already there:
+exact copy, export your data now and then (Settings → Privacy → Export data) and import it with its
+own token; re-importing skips what's already there. On a Mac, `clients/install-macos.sh` installs a
+launchd agent that does this whenever an export zip lands in `~/Downloads`:
 
 ```sh
 deploy/token.sh claude-ai-export add
+clients/install-macos.sh https://memory.example.com    # the CLI, plus the ~/Downloads watcher
+# or by hand:
 MEMORY_URL=https://memory.example.com \
 MEMORY_TOKEN=$(security find-generic-password -s memory-mcp-token -a claude-ai-export -w) \
   memory import claude-ai ~/Downloads/claude-export/conversations.json
